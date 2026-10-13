@@ -1,0 +1,3 @@
+#define DYN_IRRIP_THRESHOLD_NUMERATOR 1
+#define DYN_IRRIP_THRESHOLD_DENOMINATOR 4
+#include "dyn_irrip.l2c_repl"

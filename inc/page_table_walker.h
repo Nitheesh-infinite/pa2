@@ -120,8 +120,9 @@ class PAGE_TABLE_WALKER : public MEMORY {
 
     uint64_t get_index(uint64_t address, uint8_t cache_type),
              check_hit(CACHE &cache, uint64_t address, uint8_t type),
-             get_offset(uint64_t address, uint8_t pt_level),
-             handle_page_fault(PAGE_TABLE_PAGE* page, PACKET *packet, uint8_t pt_level);
+             get_offset(uint64_t address, uint8_t pt_level);
+
+    void handle_page_fault(PAGE_TABLE_PAGE* page, PACKET *packet, uint8_t pt_level);
 
 	uint64_t map_translation_page(bool *page_swap),
 		 map_data_page(uint64_t instr_id, uint64_t full_virtual_address, bool *page_swap);

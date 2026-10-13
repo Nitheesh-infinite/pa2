@@ -1,0 +1,3 @@
+#define DYN_BALANCED_THRESHOLD_NUMERATOR 1
+#define DYN_BALANCED_THRESHOLD_DENOMINATOR 10
+#include "dyn_irrip_balanced.l2c_repl"

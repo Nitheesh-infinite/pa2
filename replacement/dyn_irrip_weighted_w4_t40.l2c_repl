@@ -1,0 +1,4 @@
+#define DYN_WEIGHTED_INSTR_MISS_WEIGHT 4
+#define DYN_WEIGHTED_THRESHOLD_NUMERATOR 2
+#define DYN_WEIGHTED_THRESHOLD_DENOMINATOR 5
+#include "dyn_irrip_weighted.l2c_repl"

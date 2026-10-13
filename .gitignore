@@ -1,1 +1,12 @@
 Traces/
+# Generated build artifacts
+/bin/
+/obj/
+
+# Simulation inputs and outputs
+/traces/
+/results/
+
+# Course reference materials
+/PA2.docx
+/ChampSim.pptx

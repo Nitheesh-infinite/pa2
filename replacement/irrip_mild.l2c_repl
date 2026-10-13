@@ -1,0 +1,2 @@
+#define IRRIP_INSTR_INSERT_RRPV 1
+#include "irrip.l2c_repl"

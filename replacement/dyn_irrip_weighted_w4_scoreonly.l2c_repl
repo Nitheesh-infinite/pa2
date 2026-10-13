@@ -1,0 +1,3 @@
+#define DYN_WEIGHTED_INSTR_MISS_WEIGHT 4
+#define DYN_WEIGHTED_USE_PRESSURE_GATE 0
+#include "dyn_irrip_weighted.l2c_repl"

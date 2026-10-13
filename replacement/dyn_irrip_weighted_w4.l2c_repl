@@ -1,0 +1,2 @@
+#define DYN_WEIGHTED_INSTR_MISS_WEIGHT 4
+#include "dyn_irrip_weighted.l2c_repl"

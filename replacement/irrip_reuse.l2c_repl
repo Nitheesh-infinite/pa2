@@ -1,0 +1,87 @@
+#include "cache.h"
+
+#define IRRIP_REUSE_MAX_RRPV 3
+#define IRRIP_REUSE_DATA_INSERT_RRPV (IRRIP_REUSE_MAX_RRPV - 1)
+#define IRRIP_REUSE_INSTR_INSERT_RRPV 1
+#define IRRIP_REUSE_DATA_HIT_RRPV 1
+#define IRRIP_REUSE_INSTR_HIT_RRPV 0
+
+uint32_t l2_irrip_reuse_rrpv[L2C_SET][L2C_WAY];
+uint8_t l2_irrip_reuse_confirmed_instr[L2C_SET][L2C_WAY];
+
+// initialize replacement state
+void CACHE::l2c_initialize_replacement()
+{
+    cout << "Initialize reuse-aware I-RRIP state for L2C" << endl;
+
+    for (int i=0; i<L2C_SET; i++) {
+        for (int j=0; j<L2C_WAY; j++) {
+            l2_irrip_reuse_rrpv[i][j] = IRRIP_REUSE_MAX_RRPV;
+            l2_irrip_reuse_confirmed_instr[i][j] = 0;
+        }
+    }
+}
+
+// find replacement victim
+uint32_t CACHE::l2c_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, const BLOCK *current_set, uint64_t ip, uint64_t full_addr, uint32_t type)
+{
+    for (int i=0; i<L2C_WAY; i++)
+        if (current_set[i].valid == false)
+            return i;
+
+    while (1) {
+        // First evict non-instruction lines that RRIP already considers dead.
+        for (int i=0; i<L2C_WAY; i++)
+            if ((current_set[i].instruction == 0) &&
+                (l2_irrip_reuse_rrpv[set][i] == IRRIP_REUSE_MAX_RRPV))
+                return i;
+
+        // Instruction fills are not fully protected until they receive a hit.
+        // This keeps one-touch code lines from displacing useful data forever.
+        for (int i=0; i<L2C_WAY; i++)
+            if ((current_set[i].instruction != 0) &&
+                (l2_irrip_reuse_confirmed_instr[set][i] == 0) &&
+                (l2_irrip_reuse_rrpv[set][i] == IRRIP_REUSE_MAX_RRPV))
+                return i;
+
+        for (int i=0; i<L2C_WAY; i++)
+            if (l2_irrip_reuse_rrpv[set][i] == IRRIP_REUSE_MAX_RRPV)
+                return i;
+
+        for (int i=0; i<L2C_WAY; i++)
+            l2_irrip_reuse_rrpv[set][i]++;
+    }
+
+    assert(0);
+    return 0;
+}
+
+// called on every cache hit and cache fill
+void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t ip, uint64_t victim_addr, uint32_t type, uint8_t hit, uint8_t isInstruction)
+{
+    if ((type == WRITEBACK) && ip)
+        assert(0);
+
+    if (hit) {
+        if (isInstruction) {
+            l2_irrip_reuse_rrpv[set][way] = IRRIP_REUSE_INSTR_HIT_RRPV;
+            l2_irrip_reuse_confirmed_instr[set][way] = 1;
+        }
+        else {
+            l2_irrip_reuse_rrpv[set][way] = IRRIP_REUSE_DATA_HIT_RRPV;
+            l2_irrip_reuse_confirmed_instr[set][way] = 0;
+        }
+    }
+    else {
+        l2_irrip_reuse_rrpv[set][way] = isInstruction ?
+                                        IRRIP_REUSE_INSTR_INSERT_RRPV :
+                                        IRRIP_REUSE_DATA_INSERT_RRPV;
+        l2_irrip_reuse_confirmed_instr[set][way] = 0;
+    }
+}
+
+// use this function to print out your own stats at the end of simulation
+void CACHE::l2c_replacement_final_stats()
+{
+
+}

@@ -1,0 +1,3 @@
+#define DYN_WEIGHTED_THRESHOLD_NUMERATOR 2
+#define DYN_WEIGHTED_THRESHOLD_DENOMINATOR 5
+#include "dyn_irrip_weighted.l2c_repl"

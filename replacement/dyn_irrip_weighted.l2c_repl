@@ -1,0 +1,346 @@
+#include "cache.h"
+
+#ifndef DYN_WEIGHTED_MAX_RRPV
+#define DYN_WEIGHTED_MAX_RRPV 3
+#endif
+#ifndef DYN_WEIGHTED_DATA_INSERT_RRPV
+#define DYN_WEIGHTED_DATA_INSERT_RRPV (DYN_WEIGHTED_MAX_RRPV - 1)
+#endif
+#ifndef DYN_WEIGHTED_INSTR_INSERT_RRPV
+#define DYN_WEIGHTED_INSTR_INSERT_RRPV 1
+#endif
+#ifndef DYN_WEIGHTED_DATA_HIT_RRPV
+#define DYN_WEIGHTED_DATA_HIT_RRPV 1
+#endif
+#ifndef DYN_WEIGHTED_INSTR_HIT_RRPV
+#define DYN_WEIGHTED_INSTR_HIT_RRPV 0
+#endif
+
+// Weight instruction misses more heavily than non-instruction misses when
+// comparing leader policies. Existing runs show that raw total misses can
+// reject an instruction-conscious policy even when IPC improves materially.
+#ifndef DYN_WEIGHTED_INSTR_MISS_WEIGHT
+#define DYN_WEIGHTED_INSTR_MISS_WEIGHT 3
+#endif
+#ifndef DYN_WEIGHTED_LEADER_PERIOD
+#define DYN_WEIGHTED_LEADER_PERIOD 64
+#endif
+#ifndef DYN_WEIGHTED_RRIP_LEADER_OFFSET
+#define DYN_WEIGHTED_RRIP_LEADER_OFFSET 0
+#endif
+#ifndef DYN_WEIGHTED_IRRIP_LEADER_OFFSET
+#define DYN_WEIGHTED_IRRIP_LEADER_OFFSET 1
+#endif
+#ifndef DYN_WEIGHTED_THRESHOLD_NUMERATOR
+#define DYN_WEIGHTED_THRESHOLD_NUMERATOR 1
+#endif
+#ifndef DYN_WEIGHTED_THRESHOLD_DENOMINATOR
+#define DYN_WEIGHTED_THRESHOLD_DENOMINATOR 4
+#endif
+#ifndef DYN_WEIGHTED_MAX_COUNTER
+#define DYN_WEIGHTED_MAX_COUNTER 32768
+#endif
+#ifndef DYN_WEIGHTED_USE_PRESSURE_GATE
+#define DYN_WEIGHTED_USE_PRESSURE_GATE 1
+#endif
+
+#define DYN_WEIGHTED_POLICY_RRIP 0
+#define DYN_WEIGHTED_POLICY_IRRIP 1
+#define DYN_WEIGHTED_CLASS_INSTR 0
+#define DYN_WEIGHTED_CLASS_NON_INSTR 1
+
+uint32_t l2_dyn_weighted_rrpv[L2C_SET][L2C_WAY];
+uint64_t dyn_weighted_leader_access[2][2];
+uint64_t dyn_weighted_leader_miss[2][2];
+uint64_t dyn_weighted_follow_rrip_updates = 0;
+uint64_t dyn_weighted_follow_irrip_updates = 0;
+
+static bool dyn_weighted_is_rrip_leader(uint32_t set)
+{
+    return (set % DYN_WEIGHTED_LEADER_PERIOD) == DYN_WEIGHTED_RRIP_LEADER_OFFSET;
+}
+
+static bool dyn_weighted_is_irrip_leader(uint32_t set)
+{
+    return (set % DYN_WEIGHTED_LEADER_PERIOD) == DYN_WEIGHTED_IRRIP_LEADER_OFFSET;
+}
+
+static uint64_t dyn_weighted_policy_access(uint32_t policy)
+{
+    return dyn_weighted_leader_access[policy][DYN_WEIGHTED_CLASS_INSTR] +
+           dyn_weighted_leader_access[policy][DYN_WEIGHTED_CLASS_NON_INSTR];
+}
+
+static uint64_t dyn_weighted_policy_miss(uint32_t policy)
+{
+    return dyn_weighted_leader_miss[policy][DYN_WEIGHTED_CLASS_INSTR] +
+           dyn_weighted_leader_miss[policy][DYN_WEIGHTED_CLASS_NON_INSTR];
+}
+
+static uint64_t dyn_weighted_policy_score(uint32_t policy)
+{
+    return (DYN_WEIGHTED_INSTR_MISS_WEIGHT *
+            dyn_weighted_leader_miss[policy][DYN_WEIGHTED_CLASS_INSTR]) +
+           dyn_weighted_leader_miss[policy][DYN_WEIGHTED_CLASS_NON_INSTR];
+}
+
+static uint64_t dyn_weighted_pressure_numerator()
+{
+    return dyn_weighted_leader_access[DYN_WEIGHTED_POLICY_RRIP][DYN_WEIGHTED_CLASS_INSTR] +
+           dyn_weighted_leader_access[DYN_WEIGHTED_POLICY_IRRIP][DYN_WEIGHTED_CLASS_INSTR] +
+           dyn_weighted_leader_miss[DYN_WEIGHTED_POLICY_RRIP][DYN_WEIGHTED_CLASS_INSTR] +
+           dyn_weighted_leader_miss[DYN_WEIGHTED_POLICY_IRRIP][DYN_WEIGHTED_CLASS_INSTR];
+}
+
+static uint64_t dyn_weighted_pressure_denominator()
+{
+    return dyn_weighted_policy_access(DYN_WEIGHTED_POLICY_RRIP) +
+           dyn_weighted_policy_access(DYN_WEIGHTED_POLICY_IRRIP) +
+           dyn_weighted_policy_miss(DYN_WEIGHTED_POLICY_RRIP) +
+           dyn_weighted_policy_miss(DYN_WEIGHTED_POLICY_IRRIP);
+}
+
+static bool dyn_weighted_instruction_pressure_above_threshold()
+{
+    uint64_t numerator = dyn_weighted_pressure_numerator();
+    uint64_t denominator = dyn_weighted_pressure_denominator();
+
+    if (denominator == 0)
+        return false;
+
+    return (numerator * DYN_WEIGHTED_THRESHOLD_DENOMINATOR) >
+           (denominator * DYN_WEIGHTED_THRESHOLD_NUMERATOR);
+}
+
+static bool dyn_weighted_irrip_score_beats_rrip()
+{
+    uint64_t rrip_access = dyn_weighted_policy_access(DYN_WEIGHTED_POLICY_RRIP);
+    uint64_t irrip_access = dyn_weighted_policy_access(DYN_WEIGHTED_POLICY_IRRIP);
+
+    if ((rrip_access == 0) || (irrip_access == 0))
+        return false;
+
+    return (dyn_weighted_policy_score(DYN_WEIGHTED_POLICY_IRRIP) * rrip_access) <=
+           (dyn_weighted_policy_score(DYN_WEIGHTED_POLICY_RRIP) * irrip_access);
+}
+
+static bool dyn_weighted_followers_use_irrip()
+{
+#if DYN_WEIGHTED_USE_PRESSURE_GATE
+    return dyn_weighted_instruction_pressure_above_threshold() &&
+           dyn_weighted_irrip_score_beats_rrip();
+#else
+    return dyn_weighted_irrip_score_beats_rrip();
+#endif
+}
+
+static bool dyn_weighted_use_irrip(uint32_t set)
+{
+    if (dyn_weighted_is_rrip_leader(set))
+        return false;
+    if (dyn_weighted_is_irrip_leader(set))
+        return true;
+    return dyn_weighted_followers_use_irrip();
+}
+
+static void dyn_weighted_age(uint32_t set)
+{
+    for (int i=0; i<L2C_WAY; i++)
+        if (l2_dyn_weighted_rrpv[set][i] < DYN_WEIGHTED_MAX_RRPV)
+            l2_dyn_weighted_rrpv[set][i]++;
+}
+
+static uint32_t dyn_weighted_rrip_victim(uint32_t set, const BLOCK *current_set)
+{
+    for (int i=0; i<L2C_WAY; i++)
+        if (current_set[i].valid == false)
+            return i;
+
+    while (1) {
+        for (int i=0; i<L2C_WAY; i++)
+            if (l2_dyn_weighted_rrpv[set][i] == DYN_WEIGHTED_MAX_RRPV)
+                return i;
+
+        dyn_weighted_age(set);
+    }
+}
+
+static uint32_t dyn_weighted_irrip_victim(uint32_t set, const BLOCK *current_set)
+{
+    for (int i=0; i<L2C_WAY; i++)
+        if (current_set[i].valid == false)
+            return i;
+
+    while (1) {
+        // Use the same eviction priority as the measured best static policy
+        // (irrip_mild): instruction lines are protected until non-instruction
+        // candidates have aged to distant re-reference.
+        for (int i=0; i<L2C_WAY; i++)
+            if ((current_set[i].instruction == 0) &&
+                (l2_dyn_weighted_rrpv[set][i] == DYN_WEIGHTED_MAX_RRPV))
+                return i;
+
+        bool aged_non_instruction = false;
+        for (int i=0; i<L2C_WAY; i++) {
+            if ((current_set[i].instruction == 0) &&
+                (l2_dyn_weighted_rrpv[set][i] < DYN_WEIGHTED_MAX_RRPV)) {
+                l2_dyn_weighted_rrpv[set][i]++;
+                aged_non_instruction = true;
+            }
+        }
+
+        if (aged_non_instruction)
+            continue;
+
+        for (int i=0; i<L2C_WAY; i++)
+            if (l2_dyn_weighted_rrpv[set][i] == DYN_WEIGHTED_MAX_RRPV)
+                return i;
+
+        dyn_weighted_age(set);
+    }
+}
+
+static void dyn_weighted_update_rrip(uint32_t set, uint32_t way, uint8_t hit)
+{
+    l2_dyn_weighted_rrpv[set][way] = hit ? 0 : DYN_WEIGHTED_DATA_INSERT_RRPV;
+}
+
+static void dyn_weighted_update_irrip(uint32_t set, uint32_t way, uint8_t hit, uint8_t isInstruction)
+{
+    if (hit) {
+        if (isInstruction) {
+            l2_dyn_weighted_rrpv[set][way] = DYN_WEIGHTED_INSTR_HIT_RRPV;
+        }
+        else {
+            l2_dyn_weighted_rrpv[set][way] = DYN_WEIGHTED_DATA_HIT_RRPV;
+        }
+    }
+    else {
+        l2_dyn_weighted_rrpv[set][way] = isInstruction ?
+                                         DYN_WEIGHTED_INSTR_INSERT_RRPV :
+                                         DYN_WEIGHTED_DATA_INSERT_RRPV;
+    }
+}
+
+static void dyn_weighted_decay_leader_stats()
+{
+    uint64_t total_access = dyn_weighted_policy_access(DYN_WEIGHTED_POLICY_RRIP) +
+                            dyn_weighted_policy_access(DYN_WEIGHTED_POLICY_IRRIP);
+    if (total_access <= DYN_WEIGHTED_MAX_COUNTER)
+        return;
+
+    for (int policy=0; policy<2; policy++) {
+        for (int access_class=0; access_class<2; access_class++) {
+            dyn_weighted_leader_access[policy][access_class] >>= 1;
+            dyn_weighted_leader_miss[policy][access_class] >>= 1;
+        }
+    }
+}
+
+static void dyn_weighted_update_leader_stats(uint32_t policy, uint8_t hit, uint8_t isInstruction)
+{
+    uint32_t access_class = isInstruction ? DYN_WEIGHTED_CLASS_INSTR :
+                                            DYN_WEIGHTED_CLASS_NON_INSTR;
+
+    dyn_weighted_leader_access[policy][access_class]++;
+    if (!hit)
+        dyn_weighted_leader_miss[policy][access_class]++;
+
+    dyn_weighted_decay_leader_stats();
+}
+
+// initialize replacement state
+void CACHE::l2c_initialize_replacement()
+{
+    cout << "Initialize weighted Dynamic I-RRIP state for L2C" << endl;
+    cout << "Weighted Dynamic I-RRIP threshold: "
+         << DYN_WEIGHTED_THRESHOLD_NUMERATOR << "/"
+         << DYN_WEIGHTED_THRESHOLD_DENOMINATOR << endl;
+    cout << "Weighted Dynamic I-RRIP instruction miss weight: "
+         << DYN_WEIGHTED_INSTR_MISS_WEIGHT << endl;
+    cout << "Weighted Dynamic I-RRIP leader counter window: "
+         << DYN_WEIGHTED_MAX_COUNTER << endl;
+    cout << "Weighted Dynamic I-RRIP pressure gate: "
+         << DYN_WEIGHTED_USE_PRESSURE_GATE << endl;
+
+    for (int policy=0; policy<2; policy++) {
+        for (int access_class=0; access_class<2; access_class++) {
+            dyn_weighted_leader_access[policy][access_class] = 0;
+            dyn_weighted_leader_miss[policy][access_class] = 0;
+        }
+    }
+    dyn_weighted_follow_rrip_updates = 0;
+    dyn_weighted_follow_irrip_updates = 0;
+
+    for (int i=0; i<L2C_SET; i++) {
+        for (int j=0; j<L2C_WAY; j++) {
+            l2_dyn_weighted_rrpv[i][j] = DYN_WEIGHTED_MAX_RRPV;
+        }
+    }
+}
+
+// find replacement victim
+uint32_t CACHE::l2c_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, const BLOCK *current_set, uint64_t ip, uint64_t full_addr, uint32_t type)
+{
+    if (dyn_weighted_use_irrip(set))
+        return dyn_weighted_irrip_victim(set, current_set);
+
+    return dyn_weighted_rrip_victim(set, current_set);
+}
+
+// called on every cache hit and cache fill
+void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t ip, uint64_t victim_addr, uint32_t type, uint8_t hit, uint8_t isInstruction)
+{
+    if ((type == WRITEBACK) && ip)
+        assert(0);
+
+    if (dyn_weighted_is_rrip_leader(set)) {
+        dyn_weighted_update_leader_stats(DYN_WEIGHTED_POLICY_RRIP, hit, isInstruction);
+        dyn_weighted_update_rrip(set, way, hit);
+        return;
+    }
+
+    if (dyn_weighted_is_irrip_leader(set)) {
+        dyn_weighted_update_leader_stats(DYN_WEIGHTED_POLICY_IRRIP, hit, isInstruction);
+        dyn_weighted_update_irrip(set, way, hit, isInstruction);
+        return;
+    }
+
+    if (dyn_weighted_followers_use_irrip()) {
+        dyn_weighted_follow_irrip_updates++;
+        dyn_weighted_update_irrip(set, way, hit, isInstruction);
+    }
+    else {
+        dyn_weighted_follow_rrip_updates++;
+        dyn_weighted_update_rrip(set, way, hit);
+    }
+}
+
+// use this function to print out your own stats at the end of simulation
+void CACHE::l2c_replacement_final_stats()
+{
+    cout << "Weighted Dynamic I-RRIP RRIP leaders instr access: "
+         << dyn_weighted_leader_access[DYN_WEIGHTED_POLICY_RRIP][DYN_WEIGHTED_CLASS_INSTR]
+         << " non-instr access: "
+         << dyn_weighted_leader_access[DYN_WEIGHTED_POLICY_RRIP][DYN_WEIGHTED_CLASS_NON_INSTR]
+         << " instr miss: "
+         << dyn_weighted_leader_miss[DYN_WEIGHTED_POLICY_RRIP][DYN_WEIGHTED_CLASS_INSTR]
+         << " non-instr miss: "
+         << dyn_weighted_leader_miss[DYN_WEIGHTED_POLICY_RRIP][DYN_WEIGHTED_CLASS_NON_INSTR] << endl;
+    cout << "Weighted Dynamic I-RRIP I-RRIP leaders instr access: "
+         << dyn_weighted_leader_access[DYN_WEIGHTED_POLICY_IRRIP][DYN_WEIGHTED_CLASS_INSTR]
+         << " non-instr access: "
+         << dyn_weighted_leader_access[DYN_WEIGHTED_POLICY_IRRIP][DYN_WEIGHTED_CLASS_NON_INSTR]
+         << " instr miss: "
+         << dyn_weighted_leader_miss[DYN_WEIGHTED_POLICY_IRRIP][DYN_WEIGHTED_CLASS_INSTR]
+         << " non-instr miss: "
+         << dyn_weighted_leader_miss[DYN_WEIGHTED_POLICY_IRRIP][DYN_WEIGHTED_CLASS_NON_INSTR] << endl;
+    cout << "Weighted Dynamic I-RRIP follower updates in RRIP mode: "
+         << dyn_weighted_follow_rrip_updates
+         << " I-RRIP mode: " << dyn_weighted_follow_irrip_updates << endl;
+    cout << "Weighted Dynamic I-RRIP scores RRIP: "
+         << dyn_weighted_policy_score(DYN_WEIGHTED_POLICY_RRIP)
+         << " I-RRIP: " << dyn_weighted_policy_score(DYN_WEIGHTED_POLICY_IRRIP)
+         << " pressure numerator: " << dyn_weighted_pressure_numerator()
+         << " denominator: " << dyn_weighted_pressure_denominator() << endl;
+}

@@ -1,0 +1,92 @@
+#include "cache.h"
+
+#ifndef IRRIP_MAX_RRPV
+#define IRRIP_MAX_RRPV 3
+#endif
+#ifndef IRRIP_DATA_INSERT_RRPV
+#define IRRIP_DATA_INSERT_RRPV (IRRIP_MAX_RRPV - 1)
+#endif
+#ifndef IRRIP_INSTR_INSERT_RRPV
+#define IRRIP_INSTR_INSERT_RRPV 0
+#endif
+#ifndef IRRIP_DATA_HIT_RRPV
+#define IRRIP_DATA_HIT_RRPV 1
+#endif
+#ifndef IRRIP_INSTR_HIT_RRPV
+#define IRRIP_INSTR_HIT_RRPV 0
+#endif
+
+uint32_t l2_irrip_rrpv[L2C_SET][L2C_WAY];
+
+// initialize replacement state
+void CACHE::l2c_initialize_replacement()
+{
+    cout << "Initialize I-RRIP state for L2C" << endl;
+
+    for (int i=0; i<L2C_SET; i++) {
+        for (int j=0; j<L2C_WAY; j++) {
+            l2_irrip_rrpv[i][j] = IRRIP_MAX_RRPV;
+        }
+    }
+}
+
+// find replacement victim
+uint32_t CACHE::l2c_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, const BLOCK *current_set, uint64_t ip, uint64_t full_addr, uint32_t type)
+{
+    for (int i=0; i<L2C_WAY; i++)
+        if (current_set[i].valid == false)
+            return i;
+
+    while (1) {
+        // Prefer evicting data/translation lines before instruction lines.
+        for (int i=0; i<L2C_WAY; i++)
+            if ((current_set[i].instruction == 0) && (l2_irrip_rrpv[set][i] == IRRIP_MAX_RRPV))
+                return i;
+
+        bool aged_non_instruction = false;
+        for (int i=0; i<L2C_WAY; i++) {
+            if ((current_set[i].instruction == 0) && (l2_irrip_rrpv[set][i] < IRRIP_MAX_RRPV)) {
+                l2_irrip_rrpv[set][i]++;
+                aged_non_instruction = true;
+            }
+        }
+
+        if (aged_non_instruction)
+            continue;
+
+        // If the set contains only protected instruction lines, fall back to RRIP aging.
+        for (int i=0; i<L2C_WAY; i++)
+            if (l2_irrip_rrpv[set][i] == IRRIP_MAX_RRPV)
+                return i;
+
+        for (int i=0; i<L2C_WAY; i++)
+            l2_irrip_rrpv[set][i]++;
+    }
+
+    assert(0);
+    return 0;
+}
+
+// called on every cache hit and cache fill
+void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t ip, uint64_t victim_addr, uint32_t type, uint8_t hit, uint8_t isInstruction)
+{
+    if ((type == WRITEBACK) && ip)
+        assert(0);
+
+    if (hit) {
+        // Instruction hits receive RRIP's strongest promotion; data hits remain useful,
+        // but stay slightly easier to evict than recently used instruction lines.
+        l2_irrip_rrpv[set][way] = isInstruction ? IRRIP_INSTR_HIT_RRPV : IRRIP_DATA_HIT_RRPV;
+    }
+    else {
+        // Insert instruction lines as highly likely to re-reference. Data and
+        // translation lines keep SRRIP's distant insertion behavior.
+        l2_irrip_rrpv[set][way] = isInstruction ? IRRIP_INSTR_INSERT_RRPV : IRRIP_DATA_INSERT_RRPV;
+    }
+}
+
+// use this function to print out your own stats at the end of simulation
+void CACHE::l2c_replacement_final_stats()
+{
+
+}

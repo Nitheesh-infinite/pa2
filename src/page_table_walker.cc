@@ -383,7 +383,7 @@ void PAGE_TABLE_WALKER::operate()
 
 }
 
-uint64_t PAGE_TABLE_WALKER::handle_page_fault(PAGE_TABLE_PAGE* page, PACKET *packet, uint8_t pt_level)
+void PAGE_TABLE_WALKER::handle_page_fault(PAGE_TABLE_PAGE* page, PACKET *packet, uint8_t pt_level)
 {
     bool page_swap = false;
 
