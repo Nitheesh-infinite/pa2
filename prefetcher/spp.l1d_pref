@@ -1,16 +1,308 @@
 #include "cache.h"
 
 
+#define IP_TRACKER_COUNT 24
+#define PATTERN_TABLE_SIZE 512
+#define SIGNATURE_LENGTH 4
+#define STRIDE_LIMIT 31
+#define MAX_DEGREE 3
+#define ACCURACY_INTERVAL 256
+
+struct IP_TRACKER {
+    uint64_t ip;
+    uint64_t last_cl_addr;
+    int64_t last_stride;
+    uint32_t signature;
+    uint32_t lru;
+    uint8_t history_count;
+    uint8_t confidence;
+    bool valid;
+
+    IP_TRACKER(){
+        ip = 0;
+        last_cl_addr = 0;
+        last_stride = 0;
+        signature = 0;
+        lru = 0;
+        history_count = 0;
+        confidence = 0;
+        valid = false;
+    }
+};
+
+struct PATTERN_ENTRY {
+    uint64_t ip;
+    uint32_t signature;
+    int64_t next_stride;
+    uint8_t confidence;
+    bool valid;
+
+    PATTERN_ENTRY(){
+        ip = 0;
+        signature = 0;
+        next_stride = 0;
+        confidence = 0;
+        valid = false;
+    }
+};
+
+IP_TRACKER trackers[IP_TRACKER_COUNT];
+PATTERN_ENTRY patterns[PATTERN_TABLE_SIZE];
+uint64_t previous_issued = 0;
+uint64_t previous_useful = 0;
+uint64_t access_count = 0;
+uint64_t total_predictions = 0;
+uint64_t uniform_predictions = 0;
+uint64_t pattern_predictions = 0;
+
+int current_degree = 2;
+
+uint32_t get_pattern_index(uint64_t ip, uint32_t signature)
+{
+    uint64_t key = ip ^ (ip >> 16) ^ signature;
+    key ^= key >> 11;
+    return key % PATTERN_TABLE_SIZE;
+}
+
+uint32_t update_signature(uint32_t signature, int64_t stride)
+{
+    uint32_t value = (uint32_t)(stride + 32);
+    return ((signature << 6) | value) & 0xFFFFFF;
+}
+
+void update_lru(int index)
+{
+    uint32_t old_lru = trackers[index].lru;
+
+    for(int i=0; i<IP_TRACKER_COUNT; i++){
+        if(i != index && trackers[i].valid && trackers[i].lru < old_lru){
+            trackers[i].lru++;
+        }
+    }
+    trackers[index].lru = 0;
+}
+
+int find_tracker(uint64_t ip, uint64_t cl_addr)
+{
+    for (int i=0; i<IP_TRACKER_COUNT; i++){
+        if(trackers[i].valid && trackers[i].ip == ip){
+            return i;
+        }
+    }
+    int index = -1;
+    for(int i=0; i<IP_TRACKER_COUNT; i++){
+        if(!trackers[i].valid){
+            index = i;
+            break;
+        }
+    }
+    if(index == -1){
+        index = 0;
+        for(int i=1; i<IP_TRACKER_COUNT; i++){
+            if(trackers[i].lru > trackers[index].lru){
+                index = i;
+            }
+        }
+    }
+    trackers[index].ip = ip;
+    trackers[index].last_cl_addr = cl_addr;
+    trackers[index].last_stride = 0;
+    trackers[index].signature = 0;
+    trackers[index].history_count = 0;
+    trackers[index].confidence = 0;
+    trackers[index].valid = true;
+    trackers[index].lru = IP_TRACKER_COUNT;
+    update_lru(index);
+    return -1;
+}
+
+void train_pattern(uint64_t ip, uint32_t signature, int64_t stride)
+{
+    uint32_t index = get_pattern_index(ip, signature);
+    PATTERN_ENTRY &entry = patterns[index];
+    if (!entry.valid || entry.ip != ip ||
+        entry.signature != signature) {
+        entry.ip = ip;
+        entry.signature = signature;
+        entry.next_stride = stride;
+        entry.confidence = 1;
+        entry.valid = true;
+        return;
+    }
+    if (entry.next_stride == stride) {
+        if (entry.confidence < 3){
+            entry.confidence++;
+        }
+    }else{
+        if(entry.confidence > 0){
+            entry.confidence--;
+        }
+        if(entry.confidence == 0){
+            entry.next_stride = stride;
+            entry.confidence = 1;
+        }
+    }
+}
+
+bool predict_pattern(uint64_t ip, uint32_t signature, int64_t &stride)
+{
+    uint32_t index = get_pattern_index(ip, signature);
+    PATTERN_ENTRY &entry = patterns[index];
+    if(!entry.valid || entry.ip != ip || entry.signature != signature || entry.confidence < 2){
+        return false;
+    }
+    stride = entry.next_stride;
+    return true;
+}
 void CACHE::l1d_prefetcher_initialize() 
 {
     std::cout << "------------------------------------------------" << std::endl;
     std::cout << "        Stride Pattern Prefetcher (SPP)         " << std::endl;
     std::cout << "------------------------------------------------" << std::endl;
+    for(int i=0; i<IP_TRACKER_COUNT; i++){
+        trackers[i] = IP_TRACKER();
+    }
+    for(int i=0; i<PATTERN_TABLE_SIZE; i++){
+        patterns[i] = PATTERN_ENTRY();
+    }
+    previous_issued = 0;
+    previous_useful = 0;
+    access_count = 0;
+    total_predictions = 0;
+    uniform_predictions = 0;
+    pattern_predictions = 0;
+    current_degree = 2;
 }
 
 void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint8_t critical_ip_flag)
 {
-   
+    uint64_t cl_addr = addr >> LOG2_BLOCK_SIZE;
+    //adjust degree preiodically using useful and issued prefecthes
+    access_count++;
+    if(access_count % ACCURACY_INTERVAL == 0){
+        uint64_t issued = pf_issued - previous_issued;
+        uint64_t useful = pf_useful - previous_useful;
+        if(issued > 0){
+            double accuracy = (double)useful / issued;
+            if(accuracy < 0.25){
+                current_degree = 1;
+            }else if(accuracy < 0.50){
+                current_degree = 2;
+            }else{
+                current_degree = MAX_DEGREE;
+            }
+        }
+        previous_issued = pf_issued;
+        previous_useful = pf_useful;
+    }
+    int index = find_tracker(ip, cl_addr);
+    if(index == -1){
+        return;
+    }
+    IP_TRACKER &entry = trackers[index];
+    int64_t stride;
+    if(cl_addr >= entry.last_cl_addr){
+        stride = (int64_t)(cl_addr - entry.last_cl_addr);
+    }else{
+        stride = -(int64_t)(entry.last_cl_addr - cl_addr);
+    }
+    if(stride == 0){
+        update_lru(index);
+        return;
+    }
+
+    //track confidence in a constat stride
+    if(stride == entry.last_stride){
+        if(entry.confidence < 3){
+            entry.confidence++;
+        }
+    }else{
+        if(entry.confidence > 0){
+            entry.confidence--;
+        }
+    }
+    
+    //trian the sinature table before adding the current stride
+    if(stride >= -32 && stride <= STRIDE_LIMIT){
+        if(entry.history_count == SIGNATURE_LENGTH){
+            train_pattern(ip, entry.signature, stride);
+        }
+        entry.signature = update_signature(entry.signature, stride);
+        if(entry.history_count < SIGNATURE_LENGTH){
+            entry.history_count++;
+        }
+    }else{
+        entry.signature = 0;
+        entry.history_count = 0;
+    }
+    entry.last_cl_addr = cl_addr;
+    entry.last_stride = stride;
+    update_lru(index);
+    int64_t predicted_stride = 0;
+    uint32_t predicted_signature = entry.signature;
+    bool uniform = false;
+
+    //unifrom stride prepdcitoin has higher priority
+    if(entry.confidence >= 3){
+        predicted_stride = stride;
+        uniform = true;
+    }else if(entry.history_count == SIGNATURE_LENGTH){
+        if(!predict_pattern(ip, predicted_signature, predicted_stride)){
+            return;
+        }
+    }else{
+        return;
+    }
+    uint64_t next_cl_addr = cl_addr;
+    for(int i=0; i<current_degree; i++){
+        if(predicted_stride == 0){
+            break;
+        }
+        //prevent addres overflow 
+        if(predicted_stride > 0){
+            uint64_t delta = (uint64_t)predicted_stride;
+            if(next_cl_addr > UINT64_MAX - delta){
+                break;
+            }
+            next_cl_addr += delta;
+        }else{
+            uint64_t delta = (uint64_t)(-predicted_stride);
+            if (next_cl_addr < delta){
+                break;
+            }
+            next_cl_addr -= delta;
+        }
+        uint64_t pf_address = next_cl_addr << LOG2_BLOCK_SIZE;
+
+        //do not prefecth across a page
+        if((pf_address >> LOG2_PAGE_SIZE) != (addr >> LOG2_PAGE_SIZE)){
+            break;
+        }
+        int fill_level = FILL_L1;
+        if(MSHR.occupancy >= (MSHR.SIZE >> 1)){
+            fill_level = FILL_L2;
+        }
+        int issued = prefetch_line(ip, addr, pf_address, fill_level, 0);
+        if(!issued){
+            break;
+        }
+        total_predictions++;
+        if(uniform){
+            uniform_predictions++;
+        }else{
+            pattern_predictions++;
+        }
+        if(!uniform){
+            //advance the signatrue to predict the next stride
+            if(predicted_stride < -32 || predicted_stride > STRIDE_LIMIT){
+                break;
+            }
+            predicted_signature = update_signature(predicted_signature, predicted_stride);
+            if(!predict_pattern(ip, predicted_signature, predicted_stride)){
+                break;
+            }
+        }
+    }
 }
 
 void CACHE::l1d_prefetcher_cache_fill(uint64_t v_addr, uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t v_evicted_addr, uint64_t evicted_addr, uint32_t metadata_in)
@@ -20,5 +312,9 @@ void CACHE::l1d_prefetcher_cache_fill(uint64_t v_addr, uint64_t addr, uint32_t s
 
 void CACHE::l1d_prefetcher_final_stats()
 {
-
+    cout<<"CPU "<<cpu<<" SPP final stats"<<endl;
+    cout<<"Total prefecthes issued by SPP: "<<total_predictions<<endl;
+    cout<<"Unifrom predictions: "<<uniform_predictions<<endl;
+    cout<<"Pattern predictions: "<<pattern_predictions<<endl;
+    cout<<"Final prefetch degree: "<<current_degree<<endl; 
 }
