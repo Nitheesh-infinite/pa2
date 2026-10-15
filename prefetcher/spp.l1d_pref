@@ -1,24 +1,256 @@
 #include "cache.h"
 
+#define IP_TRACKER_COUNT 48
+#define PATTERN_COUNT 32
+#define HISTORY_LENGTH 4
+#define MAX_CONFIDENCE 3
+#define ACCURACY_WINDOW 256
+#define LOW_ACCURACY 0.40
+#define HIGH_ACCURACY 0.75
+#define USE_LOWER_LEVEL_ACCURACY 1
+#define SPP_PREFETCH_ON_HIT 1
+#define HIGH_DEGREE 4
+
+struct SPP_PATTERN {
+    uint32_t signature;
+    int16_t stride;
+    uint8_t confidence;
+    bool valid;
+};
+
+struct SPP_TRACKER {
+    uint64_t ip;
+    uint64_t last_cl_addr;
+    uint32_t signature;
+    int16_t last_stride;
+    uint8_t confidence;
+    uint8_t history_length;
+    uint8_t lru;
+    uint8_t next_pattern;
+    bool valid;
+    SPP_PATTERN patterns[PATTERN_COUNT];
+};
+
+SPP_TRACKER spp_trackers[NUM_CPUS][IP_TRACKER_COUNT];
+uint64_t last_issued[NUM_CPUS], last_useful[NUM_CPUS];
+uint32_t prefetch_degree[NUM_CPUS];
+uint64_t uniform_issued[NUM_CPUS], pattern_issued[NUM_CPUS];
+uint64_t degree_changes[NUM_CPUS];
+
+uint32_t spp_update_signature(uint32_t signature, int64_t stride)
+{
+    // I keep four strides here. Each stride uses seven bits, including its sign.
+    return ((signature << 7) | (uint32_t(stride) & 0x7F)) & 0x0FFFFFFF;
+}
+
+int spp_find_pattern(const SPP_TRACKER &tracker, uint32_t signature)
+{
+    for (int i=0; i<PATTERN_COUNT; i++) {
+        if (tracker.patterns[i].valid && tracker.patterns[i].signature == signature)
+            return i;
+    }
+    return -1;
+}
 
 void CACHE::l1d_prefetcher_initialize() 
 {
-    std::cout << "------------------------------------------------" << std::endl;
-    std::cout << "        Stride Pattern Prefetcher (SPP)         " << std::endl;
-    std::cout << "------------------------------------------------" << std::endl;
+    cout << "------------------------------------------------" << endl;
+    cout << "        Stride Pattern Prefetcher (SPP)         " << endl;
+    cout << "------------------------------------------------" << endl;
+
+    for (int i=0; i<IP_TRACKER_COUNT; i++) {
+        spp_trackers[cpu][i] = SPP_TRACKER();
+        spp_trackers[cpu][i].lru = i;
+    }
+    last_issued[cpu] = USE_LOWER_LEVEL_ACCURACY ? pf_lower_level : pf_issued;
+    last_useful[cpu] = pf_useful;
+    prefetch_degree[cpu] = 2;
+    uniform_issued[cpu] = pattern_issued[cpu] = degree_changes[cpu] = 0;
 }
 
 void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint8_t critical_ip_flag)
 {
-   
+    // I train only on demand loads, so prefetches do not train themselves.
+    if (type != LOAD)
+        return;
+
+    uint64_t issued_count = USE_LOWER_LEVEL_ACCURACY ? pf_lower_level : pf_issued;
+    // ChampSim resets these counters after warmup.
+    if (issued_count < last_issued[cpu] || pf_useful < last_useful[cpu]) {
+        last_issued[cpu] = issued_count;
+        last_useful[cpu] = pf_useful;
+        prefetch_degree[cpu] = 2;
+    }
+
+    uint64_t issued = issued_count - last_issued[cpu];
+    if (issued >= ACCURACY_WINDOW) {
+        uint64_t useful = pf_useful - last_useful[cpu];
+        double accuracy = double(useful) / issued;
+
+        uint32_t old_degree = prefetch_degree[cpu];
+        // I issue fewer lines when recent prefetches are not useful.
+        if (accuracy < LOW_ACCURACY)
+            prefetch_degree[cpu] = 1;
+        else if (accuracy < HIGH_ACCURACY)
+            prefetch_degree[cpu] = 2;
+        else
+            prefetch_degree[cpu] = HIGH_DEGREE;
+
+        if (prefetch_degree[cpu] != old_degree)
+            degree_changes[cpu]++;
+        last_issued[cpu] = issued_count;
+        last_useful[cpu] = pf_useful;
+    }
+
+    uint64_t cl_addr = addr >> LOG2_BLOCK_SIZE;
+    int index;
+    for (index=0; index<IP_TRACKER_COUNT; index++) {
+        if (spp_trackers[cpu][index].valid && spp_trackers[cpu][index].ip == ip)
+            break;
+    }
+
+    bool new_ip = (index == IP_TRACKER_COUNT);
+    if (new_ip) {
+        for (index=0; index<IP_TRACKER_COUNT; index++) {
+            if (spp_trackers[cpu][index].lru == IP_TRACKER_COUNT-1)
+                break;
+        }
+        uint8_t old_lru = spp_trackers[cpu][index].lru;
+        spp_trackers[cpu][index] = SPP_TRACKER();
+        spp_trackers[cpu][index].lru = old_lru;
+        spp_trackers[cpu][index].valid = true;
+        spp_trackers[cpu][index].ip = ip;
+        spp_trackers[cpu][index].last_cl_addr = cl_addr;
+    }
+
+    SPP_TRACKER &tracker = spp_trackers[cpu][index];
+    for (int i=0; i<IP_TRACKER_COUNT; i++) {
+        if (spp_trackers[cpu][i].lru < tracker.lru)
+            spp_trackers[cpu][i].lru++;
+    }
+    tracker.lru = 0;
+    if (new_ip)
+        return;
+
+    uint64_t distance = cl_addr > tracker.last_cl_addr
+                      ? cl_addr - tracker.last_cl_addr : tracker.last_cl_addr - cl_addr;
+    bool forward = cl_addr > tracker.last_cl_addr;
+    tracker.last_cl_addr = cl_addr;
+    if (distance == 0)
+        return;
+
+    // A same-page step can be at most 63 lines for the supplied 4 KB pages.
+    if (distance >= (1ULL << (LOG2_PAGE_SIZE - LOG2_BLOCK_SIZE))) {
+        tracker.confidence = 0;
+        tracker.history_length = 0;
+        tracker.signature = 0;
+        tracker.last_stride = 0;
+        return;
+    }
+    int64_t stride = forward ? int64_t(distance) : -int64_t(distance);
+
+    if (stride == tracker.last_stride) {
+        if (tracker.confidence < MAX_CONFIDENCE)
+            tracker.confidence++;
+    }
+    else {
+        // A different stride stops uniform prediction straight away.
+        tracker.last_stride = stride;
+        tracker.confidence = 1;
+    }
+
+    // I train the old history with the stride that actually followed it.
+    if (tracker.history_length == HISTORY_LENGTH) {
+        int entry = spp_find_pattern(tracker, tracker.signature);
+        if (entry == -1) {
+            entry = tracker.next_pattern;
+            tracker.next_pattern = (tracker.next_pattern + 1) % PATTERN_COUNT;
+            tracker.patterns[entry].signature = tracker.signature;
+            tracker.patterns[entry].stride = stride;
+            tracker.patterns[entry].confidence = 1;
+            tracker.patterns[entry].valid = true;
+        }
+        else {
+            SPP_PATTERN &pattern = tracker.patterns[entry];
+            if (pattern.stride == stride) {
+                if (pattern.confidence < MAX_CONFIDENCE)
+                    pattern.confidence++;
+            }
+            else {
+                if (pattern.confidence > 0)
+                    pattern.confidence--;
+                if (pattern.confidence == 0) {
+                    pattern.stride = stride;
+                    pattern.confidence = 1;
+                }
+            }
+        }
+    }
+
+    tracker.signature = spp_update_signature(tracker.signature, stride);
+    if (tracker.history_length < HISTORY_LENGTH)
+        tracker.history_length++;
+
+    // I still train on hits; this option only controls issuing new requests.
+    if (!SPP_PREFETCH_ON_HIT && cache_hit)
+        return;
+
+    bool uniform = (tracker.confidence == MAX_CONFIDENCE);
+    uint32_t signature = tracker.signature;
+    uint64_t next_line = cl_addr;
+
+    for (uint32_t i=0; i<prefetch_degree[cpu]; i++) {
+        int64_t next_stride = tracker.last_stride;
+        if (!uniform) {
+            if (tracker.history_length < HISTORY_LENGTH)
+                break;
+            int entry = spp_find_pattern(tracker, signature);
+            if (entry == -1 || tracker.patterns[entry].confidence < 2)
+                break;
+            next_stride = tracker.patterns[entry].stride;
+        }
+
+        // I check the offset before adding, which also handles backward strides.
+        int64_t offset = int64_t(next_line & ((1ULL << (LOG2_PAGE_SIZE - LOG2_BLOCK_SIZE)) - 1))
+                       + next_stride;
+        if (offset < 0 || offset >= (1LL << (LOG2_PAGE_SIZE - LOG2_BLOCK_SIZE)))
+            break;
+
+        if (next_stride > 0)
+            next_line += next_stride;
+        else
+            next_line -= -next_stride;
+        if (next_line == cl_addr)
+            break;
+        uint64_t pf_addr = next_line << LOG2_BLOCK_SIZE;
+        if ((pf_addr >> LOG2_PAGE_SIZE) != (addr >> LOG2_PAGE_SIZE))
+            break;
+
+        if (!prefetch_line(ip, addr, pf_addr, FILL_L1, 0))
+            break;
+        if (uniform)
+            uniform_issued[cpu]++;
+        else
+            pattern_issued[cpu]++;
+        signature = spp_update_signature(signature, next_stride);
+    }
 }
 
 void CACHE::l1d_prefetcher_cache_fill(uint64_t v_addr, uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t v_evicted_addr, uint64_t evicted_addr, uint32_t metadata_in)
 {
-	return; //metadata_in;
+    // ChampSim already counts useful prefetches when a demand uses the line.
+    return;
 }
 
 void CACHE::l1d_prefetcher_final_stats()
 {
-
+    cout << "CPU " << cpu << " SPP final degree: " << prefetch_degree[cpu] << endl;
+    cout << "SPP accuracy thresholds: " << LOW_ACCURACY << " and " << HIGH_ACCURACY
+         << ", degrees: 1, 2, " << HIGH_DEGREE << endl;
+    cout << "SPP whole-run uniform issued: " << uniform_issued[cpu]
+         << " pattern issued: " << pattern_issued[cpu]
+         << " degree changes: " << degree_changes[cpu] << endl;
+    cout << "SPP lower-level accuracy feedback: " << USE_LOWER_LEVEL_ACCURACY
+         << " prefetch on hit: " << SPP_PREFETCH_ON_HIT << endl;
+    cout << "SPP tracker storage per CPU: " << sizeof(spp_trackers[0]) << " bytes" << endl;
 }
